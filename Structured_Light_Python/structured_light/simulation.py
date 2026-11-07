@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import csv
+import importlib
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -40,6 +41,8 @@ class SimulationConfig:
     failsafe_check: int = 10
     failsafe_tolerance: float = 2e-4
     seed: int = 0
+    backend: Literal["numpy", "torch"] = "torch"
+    device: str = "cuda:0"
 
     def __post_init__(self) -> None:
         if self.grid_size < 32:
@@ -68,6 +71,13 @@ class SimulationConfig:
             raise ValueError("fourier_basis_size cannot exceed the phase screen size.")
         if self.num_subharmonics < 0:
             raise ValueError("num_subharmonics cannot be negative.")
+        if self.backend not in ("numpy", "torch"):
+            raise ValueError("backend must be 'numpy' or 'torch'.")
+        if self.device not in ("auto", "cpu", "cuda") and not (
+            self.device.startswith("cuda:")
+            and self.device.split(":", maxsplit=1)[1].isdigit()
+        ):
+            raise ValueError("device must be 'auto', 'cpu', 'cuda', or 'cuda:<index>'.")
         if self.learning_rate_exponent < 0 or self.perturbation_exponent < 0:
             raise ValueError("SPSA decay exponents cannot be negative.")
         if min(
@@ -391,6 +401,249 @@ def _measure(
     return {"metrics": metrics, "visibility_matrix": visibility_matrix, "channel_matrix": channel_matrix}
 
 
+class _TorchBackend:
+    """Keep simulation arrays and repeated propagation operations on a Torch device."""
+
+    def __init__(
+        self,
+        config: SimulationConfig,
+        x: FloatArray,
+        y: FloatArray,
+        inputs: ComplexArray,
+        targets: ComplexArray,
+        centers_yx: NDArray[np.int64],
+    ) -> None:
+        try:
+            torch = importlib.import_module("torch")
+        except ImportError as error:
+            raise RuntimeError(
+                "The Torch backend requires PyTorch. Install it with "
+                "`python -m pip install 'structured-light-python[torch]'`."
+            ) from error
+
+        if config.device.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError("The Torch backend was asked to use CUDA, but CUDA is unavailable.")
+        if config.device.startswith("cuda:"):
+            device_index = int(config.device.split(":", maxsplit=1)[1])
+            if device_index >= torch.cuda.device_count():
+                raise RuntimeError(
+                    f"CUDA device {device_index} was requested, but only "
+                    f"{torch.cuda.device_count()} CUDA device(s) are available."
+                )
+        self.torch = torch
+        self.device = torch.device(
+            "cuda" if config.device == "auto" and torch.cuda.is_available()
+            else "cpu" if config.device == "auto"
+            else config.device
+        )
+        self.config = config
+        self.inputs = torch.as_tensor(inputs, dtype=torch.complex128, device=self.device)
+        self.targets = torch.as_tensor(targets, dtype=torch.complex128, device=self.device)
+        x_tensor = torch.as_tensor(x, dtype=torch.float64, device=self.device)
+        y_tensor = torch.as_tensor(y, dtype=torch.float64, device=self.device)
+
+        self.screen_transfer = self._transfer_function(config.screen_distance)
+        focal_transfer = self._transfer_function(config.focal_length)
+        self.lens = torch.exp(
+            -1j
+            * (2 * np.pi / config.wavelength)
+            * (x_tensor.square() + y_tensor.square())
+            / (2 * config.focal_length)
+        )
+        self.focal_transfer = focal_transfer
+
+        yy, xx = torch.meshgrid(
+            torch.arange(config.grid_size, dtype=torch.float64, device=self.device),
+            torch.arange(config.grid_size, dtype=torch.float64, device=self.device),
+            indexing="ij",
+        )
+        radius = config.output_channel_size / (2 * config.pixel_size)
+        self.masks = torch.stack(
+            [
+                (yy - int(center_y)).square() + (xx - int(center_x)).square()
+                <= radius**2
+                for center_y, center_x in centers_yx
+            ]
+        )
+
+        screen_size = config.phase_screen_size or min(300, config.grid_size // 2)
+        pixel = (
+            torch.arange(screen_size, dtype=torch.float64, device=self.device)
+            - screen_size // 2
+        ) * config.pixel_size
+        self.screen_x, self.screen_y = torch.meshgrid(pixel, pixel, indexing="xy")
+        basis_size = config.fourier_basis_size
+        frequencies = torch.tensor(
+            [-1.0, 0.0, 1.0], dtype=torch.float64, device=self.device
+        ) / (basis_size * config.pixel_size)
+        self.frequency_x, self.frequency_y = torch.meshgrid(
+            frequencies, frequencies, indexing="xy"
+        )
+
+    def _transfer_function(self, distance: float) -> Any:
+        torch = self.torch
+        frequency = torch.fft.fftfreq(
+            self.config.grid_size,
+            d=self.config.pixel_size,
+            dtype=torch.float64,
+            device=self.device,
+        )
+        fx, fy = torch.meshgrid(frequency, frequency, indexing="xy")
+        wave_number = 2 * np.pi / self.config.wavelength
+        argument = 1 - self.config.wavelength**2 * (fx.square() + fy.square())
+        return torch.exp(
+            1j
+            * wave_number
+            * distance
+            * torch.sqrt(argument.to(torch.complex128))
+        )
+
+    def _propagate(self, field: Any, transfer: Any) -> Any:
+        torch = self.torch
+        shifted = torch.fft.fftshift(field, dim=(-2, -1))
+        spectrum = torch.fft.fft2(shifted, dim=(-2, -1))
+        result = torch.fft.ifft2(spectrum * transfer, dim=(-2, -1))
+        return torch.fft.ifftshift(result, dim=(-2, -1))
+
+    def _phase_screens(self, coefficients: ComplexArray, subharmonic_coefficients: ComplexArray) -> Any:
+        torch = self.torch
+        config = self.config
+        screen_size = config.phase_screen_size or min(300, config.grid_size // 2)
+        basis_size = config.fourier_basis_size
+        coefficients_tensor = torch.as_tensor(
+            coefficients, dtype=torch.complex128, device=self.device
+        )
+        subharmonics_tensor = torch.as_tensor(
+            subharmonic_coefficients, dtype=torch.complex128, device=self.device
+        )
+        coefficient_grids = coefficients_tensor.reshape(
+            config.num_screens, basis_size, basis_size
+        ).transpose(1, 2).clone()
+        coefficient_grids[:, basis_size // 2, basis_size // 2] = 0
+
+        screens = torch.ones(
+            (config.num_screens, config.grid_size, config.grid_size),
+            dtype=torch.complex128,
+            device=self.device,
+        )
+        grid_start = config.grid_size // 2 - screen_size // 2
+        grid_insertion = slice(grid_start, grid_start + screen_size)
+        insertion_start = screen_size // 2 - basis_size // 2
+        insertion = slice(insertion_start, insertion_start + basis_size)
+
+        for screen_index in range(config.num_screens):
+            spectrum = torch.zeros(
+                (screen_size, screen_size),
+                dtype=torch.complex128,
+                device=self.device,
+            )
+            spectrum[insertion, insertion] = coefficient_grids[screen_index]
+            phase = (
+                torch.fft.ifftshift(
+                    torch.fft.ifft2(torch.fft.ifftshift(spectrum))
+                )
+                * basis_size**2
+            )
+
+            for subharmonic_index in range(config.num_subharmonics):
+                low_coefficients = subharmonics_tensor[subharmonic_index].reshape(
+                    3, 3
+                ).transpose(0, 1).clone()
+                low_coefficients[1, 1] = 0
+                frequency_scale = 3 ** (subharmonic_index + 1)
+                phase = phase + torch.sum(
+                    (low_coefficients / frequency_scale)[:, :, None, None]
+                    * torch.exp(
+                        2j
+                        * np.pi
+                        * (
+                            self.frequency_x[:, :, None, None]
+                            * self.screen_x
+                            / frequency_scale
+                            + self.frequency_y[:, :, None, None]
+                            * self.screen_y
+                            / frequency_scale
+                        )
+                    ),
+                    dim=(0, 1),
+                )
+
+            phase = phase.real
+            phase = phase - phase.mean()
+            screens[screen_index, grid_insertion, grid_insertion] = torch.exp(
+                1j * phase
+            )
+        return screens
+
+    def forward(
+        self, coefficients: ComplexArray, subharmonic_coefficients: ComplexArray
+    ) -> Any:
+        field = self.inputs
+        screens = self._phase_screens(coefficients, subharmonic_coefficients)
+        for index, screen in enumerate(screens):
+            field = field * screen
+            if index < len(screens) - 1:
+                field = self._propagate(field, self.screen_transfer)
+        return self._propagate(
+            self._propagate(field, self.focal_transfer) * self.lens,
+            self.focal_transfer,
+        )
+
+    def measure(
+        self, outputs: Any, cost_weights: FloatArray
+    ) -> dict[str, float]:
+        torch = self.torch
+        config = self.config
+        output_intensity = outputs.abs().square()
+        target_intensity = self.targets.abs().square()
+        output_vectors = output_intensity.reshape(config.num_modes, -1)
+        target_vectors = target_intensity.reshape(config.num_modes, -1)
+
+        visibility_matrix = (output_vectors @ target_vectors.T).square()
+        column_sums = visibility_matrix.sum(dim=0, keepdim=True)
+        visibility_matrix = torch.where(
+            column_sums > 0,
+            visibility_matrix / column_sums.clamp_min(torch.finfo(torch.float64).tiny),
+            0,
+        )
+        visibility = torch.diagonal(visibility_matrix).mean()
+
+        channel_energy = torch.einsum(
+            "iyx,jyx->ij", output_intensity, self.masks.to(torch.float64)
+        )
+        channel_totals = channel_energy.sum(dim=1, keepdim=True)
+        channel_matrix = torch.where(
+            channel_totals > 0,
+            channel_energy
+            / channel_totals.clamp_min(torch.finfo(torch.float64).tiny),
+            0,
+        )
+        channel_accuracy = torch.diagonal(channel_matrix).mean()
+        efficiency = (output_intensity * self.masks).sum(dim=(1, 2)).mean()
+        mse = (output_intensity - target_intensity).square().sum(dim=(1, 2)).mean()
+        output_energy = output_intensity.sum()
+        loss = torch.clamp(1 - output_energy / config.num_modes, min=0)
+
+        weights = torch.as_tensor(
+            cost_weights, dtype=torch.float64, device=self.device
+        )
+        values = torch.stack(
+            (mse, 1 - channel_accuracy, 1 - visibility, loss, 1 - efficiency)
+        )
+        cost = torch.dot(weights, values) / weights.sum()
+        return {
+            "mse": float(mse.item()),
+            "visibility": float(visibility.item()),
+            "channel_accuracy": float(channel_accuracy.item()),
+            "efficiency": float(efficiency.item()),
+            "loss": float(loss.item()),
+            "cost": float(cost.item()),
+        }
+
+    def to_numpy(self, value: Any) -> ComplexArray:
+        return value.detach().cpu().numpy()
+
+
 def run_simulation(
     config: SimulationConfig | None = None,
     *,
@@ -421,15 +674,38 @@ def run_simulation(
         )
     else:
         subharmonic_coefficients = np.empty((0, 9), dtype=np.complex128)
+    torch_backend = (
+        _TorchBackend(config, x, y, inputs, targets, centers_yx)
+        if config.backend == "torch"
+        else None
+    )
+
+    def forward(coefficients_value: ComplexArray) -> Any:
+        if torch_backend is not None:
+            return torch_backend.forward(
+                coefficients_value, subharmonic_coefficients
+            )
+        return _forward(
+            inputs,
+            coefficients_value,
+            subharmonic_coefficients,
+            config,
+            x,
+            y,
+        )
+
+    def measure(outputs_value: Any, weights: FloatArray) -> dict[str, float]:
+        if torch_backend is not None:
+            return torch_backend.measure(outputs_value, weights)
+        return _measure(
+            outputs_value, targets, centers_yx, config, weights
+        )["metrics"]
+
     history: list[dict[str, float]] = []
     base_cost_weights = np.array([1.0, 0.0, 3.0, 2.0, 3.0])
     cost_weights = base_cost_weights.copy()
-    initial_outputs = _forward(
-        inputs, coefficients, subharmonic_coefficients, config, x, y
-    )
-    initial_metrics = _measure(
-        initial_outputs, targets, centers_yx, config, cost_weights
-    )["metrics"]
+    initial_outputs = forward(coefficients)
+    initial_metrics = measure(initial_outputs, cost_weights)
     failsafe_coefficients = coefficients.copy()
     failsafe_error = initial_metrics["cost"]
     system_reset = 0
@@ -448,28 +724,16 @@ def run_simulation(
         )
         plus_coefficients = coefficients + beta * direction
         minus_coefficients = coefficients - beta * direction
-        plus_outputs = _forward(
-            inputs, plus_coefficients, subharmonic_coefficients, config, x, y
-        )
-        minus_outputs = _forward(
-            inputs, minus_coefficients, subharmonic_coefficients, config, x, y
-        )
-        plus_cost = _measure(
-            plus_outputs, targets, centers_yx, config, cost_weights
-        )["metrics"]["cost"]
-        minus_cost = _measure(
-            minus_outputs, targets, centers_yx, config, cost_weights
-        )["metrics"]["cost"]
+        plus_outputs = forward(plus_coefficients)
+        minus_outputs = forward(minus_coefficients)
+        plus_cost = measure(plus_outputs, cost_weights)["cost"]
+        minus_cost = measure(minus_outputs, cost_weights)["cost"]
 
         gradient = ((minus_cost - plus_cost) / (2 * beta)) * direction
         coefficients += alpha * gradient
 
-        outputs = _forward(
-            inputs, coefficients, subharmonic_coefficients, config, x, y
-        )
-        metrics = _measure(
-            outputs, targets, centers_yx, config, cost_weights
-        )["metrics"]
+        outputs = forward(coefficients)
+        metrics = measure(outputs, cost_weights)
 
         if (epoch + 1) % config.failsafe_check == 0:
             if failsafe_error - metrics["cost"] < config.failsafe_tolerance:
@@ -492,9 +756,7 @@ def run_simulation(
                         )
                         adjusted_weights[0] += 10 * (-1) ** reset_count
                         cost_weights = adjusted_weights
-                    metrics = _measure(
-                        outputs, targets, centers_yx, config, cost_weights
-                    )["metrics"]
+                    metrics = measure(outputs, cost_weights)
                     failsafe_coefficients = coefficients.copy()
                     failsafe_error = metrics["cost"]
                     system_reset = 0
@@ -502,12 +764,8 @@ def run_simulation(
                 else:
                     coefficients = failsafe_coefficients.copy()
                     system_reset += 1
-                    outputs = _forward(
-                        inputs, coefficients, subharmonic_coefficients, config, x, y
-                    )
-                    metrics = _measure(
-                        outputs, targets, centers_yx, config, cost_weights
-                    )["metrics"]
+                    outputs = forward(coefficients)
+                    metrics = measure(outputs, cost_weights)
             else:
                 failsafe_coefficients = coefficients.copy()
                 failsafe_error = metrics["cost"]
@@ -522,23 +780,23 @@ def run_simulation(
                 f"efficiency={metrics['efficiency']:.4f}"
             )
 
-    final_outputs = _forward(
-        inputs, coefficients, subharmonic_coefficients, config, x, y
-    )
+    final_outputs = forward(coefficients)
     if config.epochs == 0:
         history.append(
             {
                 "epoch": 0.0,
-                **_measure(
-                    final_outputs, targets, centers_yx, config, cost_weights
-                )["metrics"],
+                **measure(final_outputs, cost_weights),
             }
         )
     return SimulationResult(
         config=config,
         inputs=inputs,
         targets=targets,
-        outputs=final_outputs,
+        outputs=(
+            torch_backend.to_numpy(final_outputs)
+            if torch_backend is not None
+            else final_outputs
+        ),
         centers_yx=centers_yx,
         coefficients=coefficients,
         history=history,

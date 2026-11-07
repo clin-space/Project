@@ -19,7 +19,7 @@ Dynamic: license-file
 4. 按目标输出通道计算模式可见度、通道准确率、效率和损耗。
 5. 导出训练曲线、输出强度图、指标 CSV、配置 JSON 和系数 NPZ。
 
-默认参数是为首次运行和普通电脑设计的快速示例：96×96 计算网格、48×48 屏幕、11×11 Fourier 系数网格和 10 个 epochs，不等同于原 MATLAB 文件中的 600×600、300×300 屏幕和 5000 epochs 配置。屏幕默认取计算网格边长的一半。可通过命令行增加网格大小和训练轮数。
+默认训练参数按 MATLAB 数值仿真设置：600×600 计算网格、300×300 屏幕、5 层、11×11 Fourier 系数网格、5000 epochs；LG 输入束腰为 0.4 mm，输出通道尺寸为 0.5 mm。SPSA 初始步长/扰动为 5000/0.1，衰减指数为 0.18/0.101；每 10 轮执行 failsafe 检查，cost 改善容差为 2e-4。若缩小计算网格且未指定屏幕大小，屏幕会自动设为 `min(300, grid_size // 2)`。完整默认运行会比较耗时；先用较少 epochs 做试跑。
 
 ## 环境安装
 
@@ -35,19 +35,19 @@ python -m pip install -e .
 ## 运行
 
 ```bash
-python -m structured_light --epochs 10
+python -m structured_light --epochs 5000
 ```
 
 指定网格、随机种子和输出目录：
 
 ```bash
-python -m structured_light --grid-size 128 --epochs 50 --seed 7 --output-dir results
+python -m structured_light --grid-size 600 --phase-screen-size 300 --screens 5 --epochs 100 --seed 7 --output-dir results
 ```
 
 显式设定相位屏和低频 subharmonics：
 
 ```bash
-python -m structured_light --grid-size 128 --phase-screen-size 64 --fourier-basis-size 11 --num-subharmonics 2
+python -m structured_light --grid-size 600 --phase-screen-size 300 --fourier-basis-size 11 --num-subharmonics 2 --epochs 100
 ```
 
 程序会在输出目录中生成：
@@ -65,16 +65,16 @@ python -m unittest discover -s tests -v
 
 ## 参数与 Python API
 
-可通过 `SimulationConfig` 调整 `grid_size`、相位屏大小、Fourier 系数网格尺寸、subharmonics 层数、输入模式数、相位屏层数、波长、像素大小、传播距离、输出通道尺寸、训练轮数和随机种子。Python 调用示例：
+可通过 `SimulationConfig` 调整网格和相位屏尺寸、Fourier 系数网格、subharmonics、模式/屏幕数量、传播参数、训练轮数、SPSA 步长/扰动及其衰减指数、failsafe 检查设置。Python 调用示例：
 
 ```python
 from structured_light import SimulationConfig, run_simulation
 
-result = run_simulation(SimulationConfig(grid_size=96, epochs=5))
+result = run_simulation(SimulationConfig(grid_size=96, phase_screen_size=48, epochs=5))
 print(result.final_metrics)
 ```
 
-该实现侧重于可复现的数值仿真与可运行示例，不包含 MATLAB 项目中的 SLM 硬件控制、实验标定、矢量偏振输入或 Skyrmion 测量流程。
+该实现侧重于可复现的数值仿真，不包含 MATLAB 项目中的 SLM 硬件控制、实验标定、矢量偏振输入或 Skyrmion 测量流程。SPSA 主参数、输入尺寸、传播起点和周期 failsafe 已按 MATLAB 数值仿真设置；仍与 MATLAB 不同的是额外的实验/硬件流程及部分失败时的 cost 权重保护细节。初始 cost 权重为 `[1, 0, 3, 2, 3]`。
 
 ## 来源
 

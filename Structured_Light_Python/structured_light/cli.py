@@ -71,6 +71,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     parser.add_argument(
+        "--backend",
+        choices=("numpy", "torch"),
+        default="torch",
+        help="Numerical backend (default: Torch; CUDA is used when available).",
+    )
+    parser.add_argument(
+        "--device",
+        default="cuda:0",
+        help="Torch device, e.g. auto, cpu, cuda, or cuda:1 (default: cuda:0).",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("results"),
@@ -97,6 +108,8 @@ def main() -> None:
         failsafe_check=args.failsafe_check,
         failsafe_tolerance=args.failsafe_tolerance,
         seed=args.seed,
+        backend=args.backend,
+        device=args.device,
     )
     result = run_simulation(config, verbose=not args.quiet)
     save_result(result, args.output_dir)

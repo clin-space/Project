@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import tempfile
 import unittest
@@ -19,7 +20,7 @@ from structured_light.simulation import (
 
 class SimulationTests(unittest.TestCase):
     def test_free_space_propagation_preserves_energy(self) -> None:
-        config = SimulationConfig(grid_size=48, epochs=0)
+        config = SimulationConfig(grid_size=48, epochs=0, backend="numpy")
         rng = np.random.default_rng(4)
         field = rng.normal(size=(48, 48)) + 1j * rng.normal(size=(48, 48))
         transfer = _transfer_function(config, config.screen_distance)
@@ -33,7 +34,9 @@ class SimulationTests(unittest.TestCase):
         )
 
     def test_small_training_run_and_saved_outputs(self) -> None:
-        config = SimulationConfig(grid_size=48, epochs=1, num_screens=2, seed=2)
+        config = SimulationConfig(
+            grid_size=48, epochs=1, num_screens=2, seed=2, backend="numpy"
+        )
         result = run_simulation(config, verbose=False)
 
         self.assertEqual(result.inputs.shape, (3, 48, 48))
@@ -52,6 +55,62 @@ class SimulationTests(unittest.TestCase):
             self.assertTrue((output_path / "simulation.png").is_file())
             summary = json.loads((output_path / "summary.json").read_text())
             self.assertIn("visibility", summary["final_metrics"])
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch is optional.")
+    def test_default_backend_matches_numpy_without_training(self) -> None:
+        config = SimulationConfig(
+            grid_size=48,
+            phase_screen_size=24,
+            num_screens=2,
+            epochs=0,
+            device="cpu",
+        )
+
+        torch_result = run_simulation(config, verbose=False)
+        numpy_result = run_simulation(
+            SimulationConfig(
+                grid_size=48,
+                phase_screen_size=24,
+                num_screens=2,
+                epochs=0,
+                backend="numpy",
+            ),
+            verbose=False,
+        )
+
+        np.testing.assert_allclose(torch_result.outputs, numpy_result.outputs, atol=1e-12)
+        self.assertAlmostEqual(
+            torch_result.final_metrics["cost"],
+            numpy_result.final_metrics["cost"],
+            places=12,
+        )
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch is optional.")
+    def test_torch_backend_runs_training_with_subharmonics(self) -> None:
+        result = run_simulation(
+            SimulationConfig(
+                grid_size=32,
+                phase_screen_size=16,
+                num_screens=1,
+                num_subharmonics=1,
+                epochs=1,
+                backend="torch",
+                device="cpu",
+            ),
+            verbose=False,
+        )
+
+        self.assertEqual(len(result.history), 1)
+        self.assertTrue(np.isfinite(result.final_metrics["cost"]))
+
+    def test_invalid_backend_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            SimulationConfig(backend="jax")
+
+    def test_numpy_backend_does_not_require_torch_device(self) -> None:
+        config = SimulationConfig(backend="numpy")
+
+        self.assertEqual(config.device, "cuda:0")
 
     def test_invalid_configuration_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
@@ -87,6 +146,7 @@ class SimulationTests(unittest.TestCase):
             num_screens=1,
             num_subharmonics=1,
             epochs=0,
+            backend="numpy",
         )
         result = run_simulation(config, verbose=False)
 
@@ -107,6 +167,8 @@ class SimulationTests(unittest.TestCase):
         self.assertEqual(config.perturbation_exponent, 0.101)
         self.assertEqual(config.failsafe_check, 10)
         self.assertEqual(config.failsafe_tolerance, 2e-4)
+        self.assertEqual(config.backend, "torch")
+        self.assertEqual(config.device, "cuda:0")
 
     def test_failsafe_restores_best_coefficients(self) -> None:
         config = SimulationConfig(
@@ -116,6 +178,7 @@ class SimulationTests(unittest.TestCase):
             learning_rate=1e-30,
             failsafe_check=1,
             seed=3,
+            backend="numpy",
         )
 
         result = run_simulation(config, verbose=False)
@@ -128,6 +191,7 @@ class SimulationTests(unittest.TestCase):
             phase_screen_size=24,
             num_screens=1,
             epochs=0,
+            backend="numpy",
         )
         rng = np.random.default_rng(7)
         inputs = rng.normal(size=(1, 48, 48)) + 1j * rng.normal(size=(1, 48, 48))

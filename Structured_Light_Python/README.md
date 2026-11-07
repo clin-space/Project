@@ -21,6 +21,20 @@ source .venv/bin/activate  # Windows: .venv\Scripts\activate
 python -m pip install -e .
 ```
 
+默认使用 PyTorch 后端。安装可选 Torch 依赖：
+
+```bash
+python -m pip install -e ".[torch]"
+```
+
+当前环境中 PyTorch 的 `cuda:0` 是 RTX 4090，因此默认使用 `cuda:0`。也可通过参数指定其他支持的设备：
+
+```bash
+python -m structured_light --epochs 100
+```
+
+可显式使用 `--device cuda:1`、`--device cuda`、`--device auto` 或 `--device cpu`。若指定的 CUDA 设备不可见，程序会报告错误。未安装 PyTorch 时会显示安装提示。旧的 NumPy 后端仍可通过 `--backend numpy` 选择。
+
 ## 运行
 
 ```bash
@@ -62,6 +76,8 @@ from structured_light import SimulationConfig, run_simulation
 result = run_simulation(SimulationConfig(grid_size=96, phase_screen_size=48, epochs=5))
 print(result.final_metrics)
 ```
+
+`SimulationConfig` 默认使用 Torch 和 `device="cuda:0"`；需要兼容旧计算路径时可传入 `backend="numpy"`。
 
 该实现侧重于可复现的数值仿真，不包含 MATLAB 项目中的 SLM 硬件控制、实验标定、矢量偏振输入或 Skyrmion 测量流程。SPSA 主参数、输入尺寸、传播起点和周期 failsafe 已按 MATLAB 数值仿真设置；仍与 MATLAB 不同的是额外的实验/硬件流程及部分失败时的 cost 权重保护细节。初始 cost 权重为 `[1, 0, 3, 2, 3]`。
 
