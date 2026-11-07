@@ -1,0 +1,2 @@
+[console_scripts]
+structured-light-sim = structured_light.cli:main

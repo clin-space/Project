@@ -1,0 +1,14 @@
+LICENSE
+README.md
+pyproject.toml
+structured_light/__init__.py
+structured_light/__main__.py
+structured_light/cli.py
+structured_light/simulation.py
+structured_light_python.egg-info/PKG-INFO
+structured_light_python.egg-info/SOURCES.txt
+structured_light_python.egg-info/dependency_links.txt
+structured_light_python.egg-info/entry_points.txt
+structured_light_python.egg-info/requires.txt
+structured_light_python.egg-info/top_level.txt
+tests/test_simulation.py
