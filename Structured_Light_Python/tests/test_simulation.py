@@ -10,6 +10,7 @@ import numpy as np
 
 from structured_light import SimulationConfig, run_simulation
 from structured_light.simulation import (
+    _draw_output_channels,
     _forward,
     _phase_screens,
     _propagate,
@@ -55,6 +56,29 @@ class SimulationTests(unittest.TestCase):
             self.assertTrue((output_path / "simulation.png").is_file())
             summary = json.loads((output_path / "summary.json").read_text())
             self.assertIn("visibility", summary["final_metrics"])
+
+    def test_output_channel_overlay_matches_measurement_regions(self) -> None:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        config = SimulationConfig(grid_size=48, backend="numpy")
+        centers = np.array([[12, 16], [24, 24], [36, 32]])
+        figure, axis = plt.subplots()
+        try:
+            _draw_output_channels(axis, centers, config, plt.get_cmap("tab10"))
+
+            self.assertEqual(len(axis.patches), len(centers))
+            self.assertEqual(len(axis.texts), len(centers))
+            for patch, (center_y, center_x) in zip(axis.patches, centers):
+                self.assertEqual(patch.center, (center_x, center_y))
+                self.assertEqual(
+                    patch.radius,
+                    config.output_channel_size / (2 * config.pixel_size),
+                )
+        finally:
+            plt.close(figure)
 
     @unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch is optional.")
     def test_default_backend_matches_numpy_without_training(self) -> None:

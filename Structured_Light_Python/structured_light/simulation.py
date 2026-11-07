@@ -831,6 +831,43 @@ def save_result(result: SimulationResult, output_dir: Path | str) -> None:
     _save_plot(result, output_path / "simulation.png")
 
 
+def _draw_output_channels(
+    axis: Any,
+    centers_yx: NDArray[np.int64],
+    config: SimulationConfig,
+    colormap: Any,
+) -> None:
+    from matplotlib.patches import Circle
+
+    channel_radius = config.output_channel_size / (2 * config.pixel_size)
+    for channel_index, (center_y, center_x) in enumerate(centers_yx):
+        color = colormap(channel_index % 10)
+        axis.add_patch(
+            Circle(
+                (center_x, center_y),
+                radius=channel_radius,
+                fill=False,
+                edgecolor=color,
+                linewidth=1.5,
+            )
+        )
+        axis.text(
+            center_x,
+            center_y - channel_radius - 2,
+            f"C{channel_index + 1}",
+            color="white",
+            fontsize=7,
+            ha="center",
+            va="bottom",
+            bbox={
+                "facecolor": color,
+                "edgecolor": "none",
+                "alpha": 0.8,
+                "pad": 1,
+            },
+        )
+
+
 def _save_plot(result: SimulationResult, path: Path) -> None:
     import matplotlib
 
@@ -847,6 +884,13 @@ def _save_plot(result: SimulationResult, path: Path) -> None:
         )
         for axis, (intensity, title) in zip(axes[index], items):
             axis.imshow(intensity, cmap="inferno")
+            if title == "Output":
+                _draw_output_channels(
+                    axis,
+                    result.centers_yx,
+                    result.config,
+                    plt.get_cmap("tab10"),
+                )
             axis.set_title(f"Mode {index + 1}: {title}")
             axis.set_axis_off()
 
