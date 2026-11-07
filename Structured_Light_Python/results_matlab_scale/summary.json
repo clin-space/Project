@@ -1,0 +1,46 @@
+{
+  "config": {
+    "grid_size": 600,
+    "num_modes": 3,
+    "num_screens": 5,
+    "epochs": 100,
+    "wavelength": 6.33e-07,
+    "pixel_size": 8e-06,
+    "focal_length": 0.5,
+    "screen_distance": 0.1,
+    "input_waist": 0.0004,
+    "output_channel_size": 0.0005,
+    "phase_screen_size": 300,
+    "fourier_basis_size": 11,
+    "num_subharmonics": 0,
+    "learning_rate": 5000.0,
+    "perturbation": 0.1,
+    "learning_rate_exponent": 0.18,
+    "perturbation_exponent": 0.101,
+    "failsafe_check": 10,
+    "failsafe_tolerance": 0.0002,
+    "seed": 0
+  },
+  "final_metrics": {
+    "mse": 0.0011686894250454761,
+    "visibility": 0.9805606674243014,
+    "channel_accuracy": 0.5574618940868739,
+    "efficiency": 0.207059261535365,
+    "loss": 0.0,
+    "cost": 0.27092321139400516
+  },
+  "channel_centers_yx": [
+    [
+      245,
+      268
+    ],
+    [
+      300,
+      300
+    ],
+    [
+      355,
+      332
+    ]
+  ]
+}

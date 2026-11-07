@@ -19,27 +19,35 @@ ComplexArray = NDArray[np.complex128]
 class SimulationConfig:
     """Physical and numerical settings for a simulation run."""
 
-    grid_size: int = 96
+    grid_size: int = 600
     num_modes: int = 3
-    num_screens: int = 3
-    epochs: int = 10
+    num_screens: int = 5
+    epochs: int = 5000
     wavelength: float = 633e-9
     pixel_size: float = 8e-6
     focal_length: float = 500e-3
     screen_distance: float = 100e-3
-    input_waist: float = 0.2e-3
+    input_waist: float = 0.4e-3
     # Target output-channel diameter in meters.
-    output_channel_size: float = 0.16e-3
+    output_channel_size: float = 0.5e-3
     phase_screen_size: int | None = None
     fourier_basis_size: int = 11
     num_subharmonics: int = 0
-    learning_rate: float = 0.2
-    perturbation: float = 0.05
+    learning_rate: float = 5e3
+    perturbation: float = 0.1
+    learning_rate_exponent: float = 0.18
+    perturbation_exponent: float = 0.101
+    failsafe_check: int = 10
+    failsafe_tolerance: float = 2e-4
     seed: int = 0
 
     def __post_init__(self) -> None:
         if self.grid_size < 32:
             raise ValueError("grid_size must be at least 32.")
+        phase_screen_size = self.phase_screen_size
+        if phase_screen_size is None:
+            phase_screen_size = min(300, self.grid_size // 2)
+            object.__setattr__(self, "phase_screen_size", phase_screen_size)
         if self.num_modes < 1:
             raise ValueError("num_modes must be positive.")
         if self.num_modes > 9:
@@ -48,17 +56,20 @@ class SimulationConfig:
             raise ValueError("num_screens must be positive.")
         if self.epochs < 0:
             raise ValueError("epochs cannot be negative.")
-        if self.phase_screen_size is not None and not (
-            1 <= self.phase_screen_size <= self.grid_size
-        ):
+        if self.failsafe_check < 1:
+            raise ValueError("failsafe_check must be positive.")
+        if self.failsafe_tolerance < 0:
+            raise ValueError("failsafe_tolerance cannot be negative.")
+        if not 1 <= phase_screen_size <= self.grid_size:
             raise ValueError("phase_screen_size must be between 1 and grid_size.")
         if self.fourier_basis_size < 1 or self.fourier_basis_size % 2 == 0:
             raise ValueError("fourier_basis_size must be a positive odd integer.")
-        effective_screen_size = self.phase_screen_size or self.grid_size // 2
-        if self.fourier_basis_size > effective_screen_size:
+        if self.fourier_basis_size > phase_screen_size:
             raise ValueError("fourier_basis_size cannot exceed the phase screen size.")
         if self.num_subharmonics < 0:
             raise ValueError("num_subharmonics cannot be negative.")
+        if self.learning_rate_exponent < 0 or self.perturbation_exponent < 0:
+            raise ValueError("SPSA decay exponents cannot be negative.")
         if min(
             self.wavelength,
             self.pixel_size,
@@ -194,7 +205,7 @@ def _phase_screens(
 ) -> ComplexArray:
     """Build unit-amplitude phase screens from centered Fourier coefficients."""
     grid_size = config.grid_size
-    screen_size = config.phase_screen_size or grid_size // 2
+    screen_size = config.phase_screen_size or min(300, grid_size // 2)
     basis_size = config.fourier_basis_size
     if subharmonic_coefficients.shape != (config.num_subharmonics, 9):
         raise ValueError(
@@ -305,7 +316,7 @@ def _forward(
     x: FloatArray,
     y: FloatArray,
 ) -> ComplexArray:
-    field = _lens_propagate(inputs, config, x, y)
+    field = inputs
     screens = _phase_screens(coefficients, config, subharmonic_coefficients)
     between_screens = _transfer_function(config, config.screen_distance)
     for index, screen in enumerate(screens):
@@ -320,6 +331,7 @@ def _measure(
     targets: ComplexArray,
     centers_yx: NDArray[np.int64],
     config: SimulationConfig,
+    cost_weights: FloatArray | None = None,
 ) -> dict[str, Any]:
     output_intensity = np.abs(outputs) ** 2
     target_intensity = np.abs(targets) ** 2
@@ -360,7 +372,11 @@ def _measure(
     output_energy = float(np.sum(output_intensity))
     # Every input LG mode is normalized to unit energy before propagation.
     loss = max(0.0, 1 - output_energy / config.num_modes)
-    weights = np.array([1.0, 0.0, 3.0, 2.0, 3.0])
+    weights = (
+        np.array([1.0, 0.0, 3.0, 2.0, 3.0])
+        if cost_weights is None
+        else cost_weights
+    )
     metrics = {
         "mse": mse,
         "visibility": visibility,
@@ -406,31 +422,96 @@ def run_simulation(
     else:
         subharmonic_coefficients = np.empty((0, 9), dtype=np.complex128)
     history: list[dict[str, float]] = []
+    base_cost_weights = np.array([1.0, 0.0, 3.0, 2.0, 3.0])
+    cost_weights = base_cost_weights.copy()
+    initial_outputs = _forward(
+        inputs, coefficients, subharmonic_coefficients, config, x, y
+    )
+    initial_metrics = _measure(
+        initial_outputs, targets, centers_yx, config, cost_weights
+    )["metrics"]
+    failsafe_coefficients = coefficients.copy()
+    failsafe_error = initial_metrics["cost"]
+    system_reset = 0
+    reset_count = 0
 
     for epoch in range(config.epochs):
         direction = rng.choice(np.array([-1.0, 1.0]), size=coefficients.shape)
         direction = direction + 1j * rng.choice(
             np.array([-1.0, 1.0]), size=coefficients.shape
         )
-        plus_coefficients = coefficients + config.perturbation * direction
-        minus_coefficients = coefficients - config.perturbation * direction
+        alpha = config.learning_rate / (
+            (epoch + 1) ** config.learning_rate_exponent
+        )
+        beta = config.perturbation / (
+            (epoch + 1) ** config.perturbation_exponent
+        )
+        plus_coefficients = coefficients + beta * direction
+        minus_coefficients = coefficients - beta * direction
         plus_outputs = _forward(
             inputs, plus_coefficients, subharmonic_coefficients, config, x, y
         )
         minus_outputs = _forward(
             inputs, minus_coefficients, subharmonic_coefficients, config, x, y
         )
-        plus_cost = _measure(plus_outputs, targets, centers_yx, config)["metrics"]["cost"]
-        minus_cost = _measure(minus_outputs, targets, centers_yx, config)["metrics"]["cost"]
+        plus_cost = _measure(
+            plus_outputs, targets, centers_yx, config, cost_weights
+        )["metrics"]["cost"]
+        minus_cost = _measure(
+            minus_outputs, targets, centers_yx, config, cost_weights
+        )["metrics"]["cost"]
 
-        gradient = ((plus_cost - minus_cost) / (2 * config.perturbation)) * direction
-        step_size = config.learning_rate / ((epoch + 1) ** 0.602)
-        coefficients -= step_size * gradient
+        gradient = ((minus_cost - plus_cost) / (2 * beta)) * direction
+        coefficients += alpha * gradient
 
         outputs = _forward(
             inputs, coefficients, subharmonic_coefficients, config, x, y
         )
-        metrics = _measure(outputs, targets, centers_yx, config)["metrics"]
+        metrics = _measure(
+            outputs, targets, centers_yx, config, cost_weights
+        )["metrics"]
+
+        if (epoch + 1) % config.failsafe_check == 0:
+            if failsafe_error - metrics["cost"] < config.failsafe_tolerance:
+                if system_reset > 3:
+                    if config.epochs - (epoch + 1) < 0.8 * config.epochs:
+                        cost_weights = base_cost_weights.copy()
+                    else:
+                        scales = np.array(
+                            [
+                                1.0,
+                                metrics["channel_accuracy"],
+                                metrics["visibility"],
+                                1 - metrics["loss"],
+                                metrics["efficiency"],
+                            ]
+                        )
+                        adjusted_weights = np.divide(
+                            base_cost_weights,
+                            np.maximum(scales, np.finfo(np.float64).eps),
+                        )
+                        adjusted_weights[0] += 10 * (-1) ** reset_count
+                        cost_weights = adjusted_weights
+                    metrics = _measure(
+                        outputs, targets, centers_yx, config, cost_weights
+                    )["metrics"]
+                    failsafe_coefficients = coefficients.copy()
+                    failsafe_error = metrics["cost"]
+                    system_reset = 0
+                    reset_count += 1
+                else:
+                    coefficients = failsafe_coefficients.copy()
+                    system_reset += 1
+                    outputs = _forward(
+                        inputs, coefficients, subharmonic_coefficients, config, x, y
+                    )
+                    metrics = _measure(
+                        outputs, targets, centers_yx, config, cost_weights
+                    )["metrics"]
+            else:
+                failsafe_coefficients = coefficients.copy()
+                failsafe_error = metrics["cost"]
+
         history.append({"epoch": float(epoch + 1), **metrics})
         if verbose:
             print(
@@ -445,7 +526,14 @@ def run_simulation(
         inputs, coefficients, subharmonic_coefficients, config, x, y
     )
     if config.epochs == 0:
-        history.append({"epoch": 0.0, **_measure(final_outputs, targets, centers_yx, config)["metrics"]})
+        history.append(
+            {
+                "epoch": 0.0,
+                **_measure(
+                    final_outputs, targets, centers_yx, config, cost_weights
+                )["metrics"],
+            }
+        )
     return SimulationResult(
         config=config,
         inputs=inputs,

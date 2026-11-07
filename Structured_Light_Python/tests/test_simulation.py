@@ -9,6 +9,7 @@ import numpy as np
 
 from structured_light import SimulationConfig, run_simulation
 from structured_light.simulation import (
+    _forward,
     _phase_screens,
     _propagate,
     _transfer_function,
@@ -90,6 +91,64 @@ class SimulationTests(unittest.TestCase):
         result = run_simulation(config, verbose=False)
 
         self.assertTrue(np.isfinite(result.final_metrics["cost"]))
+
+    def test_matlab_default_training_parameters(self) -> None:
+        config = SimulationConfig()
+
+        self.assertEqual(config.grid_size, 600)
+        self.assertEqual(config.phase_screen_size, 300)
+        self.assertEqual(config.num_screens, 5)
+        self.assertEqual(config.epochs, 5000)
+        self.assertEqual(config.input_waist, 0.4e-3)
+        self.assertEqual(config.output_channel_size, 0.5e-3)
+        self.assertEqual(config.learning_rate, 5e3)
+        self.assertEqual(config.perturbation, 0.1)
+        self.assertEqual(config.learning_rate_exponent, 0.18)
+        self.assertEqual(config.perturbation_exponent, 0.101)
+        self.assertEqual(config.failsafe_check, 10)
+        self.assertEqual(config.failsafe_tolerance, 2e-4)
+
+    def test_failsafe_restores_best_coefficients(self) -> None:
+        config = SimulationConfig(
+            grid_size=48,
+            num_screens=1,
+            epochs=1,
+            learning_rate=1e-30,
+            failsafe_check=1,
+            seed=3,
+        )
+
+        result = run_simulation(config, verbose=False)
+
+        np.testing.assert_array_equal(result.coefficients, np.zeros_like(result.coefficients))
+
+    def test_forward_starts_from_input_without_prelens(self) -> None:
+        config = SimulationConfig(
+            grid_size=48,
+            phase_screen_size=24,
+            num_screens=1,
+            epochs=0,
+        )
+        rng = np.random.default_rng(7)
+        inputs = rng.normal(size=(1, 48, 48)) + 1j * rng.normal(size=(1, 48, 48))
+        x = np.zeros((48, 48))
+        y = np.zeros((48, 48))
+        coefficients = np.zeros((1, config.fourier_basis_size**2), dtype=np.complex128)
+
+        actual = _forward(
+            inputs,
+            coefficients,
+            np.empty((0, 9), dtype=np.complex128),
+            config,
+            x,
+            y,
+        )
+        expected = _propagate(
+            _propagate(inputs, _transfer_function(config, config.focal_length)),
+            _transfer_function(config, config.focal_length),
+        )
+
+        np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
 
 
 if __name__ == "__main__":
