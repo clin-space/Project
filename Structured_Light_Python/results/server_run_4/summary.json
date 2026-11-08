@@ -1,0 +1,48 @@
+{
+  "config": {
+    "grid_size": 600,
+    "num_modes": 3,
+    "num_screens": 5,
+    "epochs": 5000,
+    "wavelength": 6.33e-07,
+    "pixel_size": 8e-06,
+    "focal_length": 0.5,
+    "screen_distance": 0.1,
+    "input_waist": 0.0004,
+    "output_channel_size": 0.0005,
+    "phase_screen_size": 300,
+    "fourier_basis_size": 11,
+    "num_subharmonics": 0,
+    "learning_rate": 5000.0,
+    "perturbation": 0.1,
+    "learning_rate_exponent": 0.18,
+    "perturbation_exponent": 0.101,
+    "failsafe_check": 10,
+    "failsafe_tolerance": 0.0002,
+    "seed": 0,
+    "backend": "torch",
+    "device": "cuda:0"
+  },
+  "final_metrics": {
+    "mse": 0.0008823468652342161,
+    "visibility": 0.9761684951317695,
+    "channel_accuracy": 0.6453556285404234,
+    "efficiency": 0.8007623824114891,
+    "loss": 0.0012849257427767213,
+    "cost": 0.0747399517467791
+  },
+  "channel_centers_yx": [
+    [
+      269,
+      246
+    ],
+    [
+      300,
+      300
+    ],
+    [
+      331,
+      246
+    ]
+  ]
+}

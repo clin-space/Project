@@ -10,10 +10,15 @@ import numpy as np
 
 from structured_light import SimulationConfig, run_simulation
 from structured_light.simulation import (
+    _adjust_cost_weights,
     _draw_output_channels,
     _forward,
+    _honeycomb_centers,
+    _measure,
     _phase_screens,
     _propagate,
+    _target_mode_width,
+    _target_modes,
     _transfer_function,
     save_result,
 )
@@ -75,7 +80,7 @@ class SimulationTests(unittest.TestCase):
                 self.assertEqual(patch.center, (center_x, center_y))
                 self.assertEqual(
                     patch.radius,
-                    config.output_channel_size / (2 * config.pixel_size),
+                    _target_mode_width(config) / 2,
                 )
         finally:
             plt.close(figure)
@@ -140,7 +145,7 @@ class SimulationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             SimulationConfig(grid_size=16)
 
-    def test_matlab_style_phase_screen_is_centered_and_unit_amplitude(self) -> None:
+    def test_matlab_style_phase_screen_is_zero_outside_aperture(self) -> None:
         config = SimulationConfig(
             grid_size=48,
             phase_screen_size=24,
@@ -158,10 +163,83 @@ class SimulationTests(unittest.TestCase):
         )
 
         self.assertEqual(screens.shape, (2, 48, 48))
-        np.testing.assert_allclose(np.abs(screens), 1.0, atol=1e-12)
-        np.testing.assert_array_equal(screens[1], np.ones((48, 48)))
-        np.testing.assert_array_equal(screens[0, :12], np.ones((12, 48)))
-        self.assertGreater(float(np.max(np.abs(screens[0] - 1))), 0)
+        np.testing.assert_allclose(np.abs(screens[:, 12:36, 12:36]), 1.0, atol=1e-12)
+        np.testing.assert_array_equal(screens[1, 12:36, 12:36], np.ones((24, 24)))
+        np.testing.assert_array_equal(screens[:, :12], np.zeros((2, 12, 48)))
+        self.assertGreater(float(np.max(np.abs(screens[0, 12:36, 12:36] - 1))), 0)
+
+    def test_honeycomb_centers_match_matlab_axis_order_and_floor(self) -> None:
+        centers = _honeycomb_centers(3, 200, 63)
+
+        np.testing.assert_array_equal(
+            centers, np.array([[68, 45], [100, 100], [131, 45]])
+        )
+
+    def test_matlab_target_mode_has_finite_support_and_sampled_waist(self) -> None:
+        config = SimulationConfig(grid_size=96, num_modes=1, backend="numpy")
+        target = _target_modes(config, np.array([[48, 48]]))[0]
+        width = config.output_channel_size / config.pixel_size
+        axis = np.linspace(-width / 2, width / 2 - 1, 62)
+        x, y = np.meshgrid(axis, axis)
+        expected = np.exp(-(x**2 + y**2) / (width / 4) ** 2)
+        expected /= np.linalg.norm(expected)
+
+        self.assertEqual(_target_mode_width(config), 62)
+        self.assertEqual(np.count_nonzero(target), 62**2)
+        np.testing.assert_allclose(target[17:79, 17:79], expected, atol=1e-15)
+
+    def test_adjusted_cost_weights_cannot_be_negative(self) -> None:
+        base_weights = np.array([1.0, 0.0, 3.0, 2.0, 3.0])
+        metrics = {
+            "channel_accuracy": 0.9,
+            "visibility": 0.95,
+            "loss": 0.003,
+            "efficiency": 0.776,
+        }
+
+        adjusted = _adjust_cost_weights(base_weights, metrics, reset_count=1)
+
+        self.assertEqual(adjusted[0], 0.0)
+        self.assertTrue(np.all(adjusted >= 0))
+        self.assertGreater(adjusted.sum(), 0)
+
+    def test_efficiency_uses_all_inputs_per_channel(self) -> None:
+        config = SimulationConfig(
+            grid_size=48,
+            num_modes=2,
+            output_channel_size=4 * 8e-6,
+            backend="numpy",
+        )
+        centers = np.array([[12, 12], [36, 36]])
+        outputs = np.zeros((2, 48, 48), dtype=np.complex128)
+        outputs[0, 12, 12] = np.sqrt(2)
+        outputs[0, 36, 36] = np.sqrt(3)
+        outputs[1, 12, 12] = np.sqrt(5)
+        outputs[1, 36, 36] = np.sqrt(7)
+        targets = np.zeros_like(outputs)
+
+        metrics = _measure(outputs, targets, centers, config)["metrics"]
+
+        self.assertAlmostEqual(metrics["efficiency"], ((2 + 5) / 5 + (3 + 7) / 12) / 2)
+        self.assertAlmostEqual(metrics["channel_accuracy"], (2 / 7 + 7 / 10) / 2)
+
+    def test_visibility_normalizes_each_input_mode(self) -> None:
+        config = SimulationConfig(grid_size=32, num_modes=3, backend="numpy")
+        centers = np.array([[5, 5], [16, 16], [26, 26]])
+        intensities = np.array([[2.0, 10.0, 1.0], [1.0, 10.0, 1.0], [1.0, 10.0, 2.0]])
+        outputs = np.zeros((3, 32, 32), dtype=np.complex128)
+        targets = np.zeros_like(outputs)
+        for mode_index in range(3):
+            for channel_index, (y, x) in enumerate(centers):
+                outputs[mode_index, y, x] = np.sqrt(intensities[mode_index, channel_index])
+            targets[mode_index, *centers[mode_index]] = 1
+
+        measured = _measure(outputs, targets, centers, config)
+        expected = intensities.T**2
+        expected /= expected.sum(axis=0, keepdims=True)
+
+        np.testing.assert_allclose(measured["visibility_matrix"], expected)
+        self.assertAlmostEqual(measured["metrics"]["visibility"], np.trace(expected) / 3)
 
     def test_subharmonics_run_with_physical_pixel_grid(self) -> None:
         config = SimulationConfig(
@@ -232,7 +310,15 @@ class SimulationTests(unittest.TestCase):
             y,
         )
         expected = _propagate(
-            _propagate(inputs, _transfer_function(config, config.focal_length)),
+            _propagate(
+                inputs
+                * _phase_screens(
+                    coefficients,
+                    config,
+                    np.empty((0, 9), dtype=np.complex128),
+                )[0],
+                _transfer_function(config, config.focal_length),
+            ),
             _transfer_function(config, config.focal_length),
         )
 

@@ -176,12 +176,13 @@ def _honeycomb_centers(num_modes: int, grid_size: int, spacing: int) -> NDArray[
         left = column[: left_count - len(left)] + left
         ring += 1
 
-    right = [(-x, -y) for x, y in reversed(left)]
+    # MATLAB mirrors only the first coordinate before swapping axes.
+    right = [(-x, y) for x, y in reversed(left)]
     positions = left + ([(0.0, 0.0)] if num_modes % 2 else []) + right
     center = grid_size // 2
-    # MATLAB's original helper rotates its generated (x, y) coordinate pairs.
+    # MATLAB floors the offsets, swaps their axes, then adds the grid center.
     centers = np.array(
-        [(round(center + y), round(center + x)) for x, y in positions],
+        [(center + np.floor(x), center + np.floor(y)) for x, y in positions],
         dtype=np.int64,
     )
     margin = max(4, spacing // 2)
@@ -190,15 +191,46 @@ def _honeycomb_centers(num_modes: int, grid_size: int, spacing: int) -> NDArray[
     return centers
 
 
+def _target_mode_width(config: SimulationConfig) -> int:
+    # MATLAB's linspace(..., channel_size / pixel_size) floors a noninteger count.
+    return max(1, int(np.floor(config.output_channel_size / config.pixel_size)))
+
+
 def _target_modes(config: SimulationConfig, centers_yx: NDArray[np.int64]) -> ComplexArray:
     grid_size = config.grid_size
-    y, x = np.indices((grid_size, grid_size), dtype=np.float64)
-    waist_pixels = config.output_channel_size / (4 * config.pixel_size)
+    physical_width_pixels = config.output_channel_size / config.pixel_size
+    mode_width = _target_mode_width(config)
+    axis = np.linspace(
+        -physical_width_pixels / 2,
+        physical_width_pixels / 2 - 1,
+        mode_width,
+    )
+    x, y = np.meshgrid(axis, axis)
+    local_mode = np.exp(-(x**2 + y**2) / (physical_width_pixels / 4) ** 2)
+
+    # MATLAB pads by round(5 / 2) pixels on both sides, then pads again to
+    # grid_size and uses nearest-neighbor imresize if the sizes differ.
+    mode = np.pad(local_mode, 3)
+    second_pad = int(np.floor(abs(grid_size - mode.shape[0]) / 2 + 0.5))
+    mode = np.pad(mode, second_pad)
+    if mode.shape[0] != grid_size:
+        indices = np.minimum(
+            ((np.arange(grid_size) + 0.5) * mode.shape[0] / grid_size).astype(int),
+            mode.shape[0] - 1,
+        )
+        mode = mode[np.ix_(indices, indices)]
+
+    grid_center = grid_size // 2
     targets = []
     for center_y, center_x in centers_yx:
-        field = np.exp(
-            -((x - center_x) ** 2 + (y - center_y) ** 2) / waist_pixels**2
-        ).astype(np.complex128)
+        shift_y = int(center_y) - grid_center
+        shift_x = int(center_x) - grid_center
+        source_y = slice(max(0, -shift_y), min(grid_size, grid_size - shift_y))
+        source_x = slice(max(0, -shift_x), min(grid_size, grid_size - shift_x))
+        dest_y = slice(max(0, shift_y), min(grid_size, grid_size + shift_y))
+        dest_x = slice(max(0, shift_x), min(grid_size, grid_size + shift_x))
+        field = np.zeros((grid_size, grid_size), dtype=np.complex128)
+        field[dest_y, dest_x] = mode[source_y, source_x]
         targets.append(_normalize(field))
     return np.stack(targets)
 
@@ -213,7 +245,7 @@ def _phase_screens(
     config: SimulationConfig,
     subharmonic_coefficients: ComplexArray,
 ) -> ComplexArray:
-    """Build unit-amplitude phase screens from centered Fourier coefficients."""
+    """Build finite-aperture phase screens from centered Fourier coefficients."""
     grid_size = config.grid_size
     screen_size = config.phase_screen_size or min(300, grid_size // 2)
     basis_size = config.fourier_basis_size
@@ -232,7 +264,7 @@ def _phase_screens(
         np.arange(screen_size, dtype=np.float64) - screen_size // 2
     ) * config.pixel_size
     x, y = np.meshgrid(pixel, pixel)
-    screens = np.ones(
+    screens = np.zeros(
         (config.num_screens, grid_size, grid_size), dtype=np.complex128
     )
     grid_center = grid_size // 2
@@ -256,7 +288,7 @@ def _phase_screens(
             * basis_size**2
         )
 
-        #训练时是否添加相位载频
+        #训练时是否添加相位载频？
         if config.num_subharmonics:
             length = basis_size * config.pixel_size
             base_frequency_spacing = 1 / length
@@ -348,7 +380,9 @@ def _measure(
     output_vectors = output_intensity.reshape(config.num_modes, -1)
     target_vectors = target_intensity.reshape(config.num_modes, -1)
 
-    overlap = output_vectors @ target_vectors.T
+    # MATLAB's visibility matrix has targets as rows and inputs as columns;
+    # normalizing columns therefore rewards each input reaching its target.
+    overlap = target_vectors @ output_vectors.T
     visibility_matrix = overlap**2
     column_sums = visibility_matrix.sum(axis=0, keepdims=True)
     visibility_matrix = np.divide(
@@ -360,7 +394,7 @@ def _measure(
     visibility = float(np.mean(np.diag(visibility_matrix)))
 
     yy, xx = np.indices((config.grid_size, config.grid_size))
-    radius = config.output_channel_size / (2 * config.pixel_size)
+    radius = _target_mode_width(config) / 2
     masks = np.stack(
         [
             (yy - center_y) ** 2 + (xx - center_x) ** 2 <= radius**2
@@ -368,7 +402,8 @@ def _measure(
         ]
     )
     channel_energy = np.einsum("iyx,jyx->ij", output_intensity, masks, optimize=True)
-    channel_totals = channel_energy.sum(axis=1, keepdims=True)
+    # MATLAB normalizes each output channel over all input modes.
+    channel_totals = channel_energy.sum(axis=0, keepdims=True)
     channel_matrix = np.divide(
         channel_energy,
         channel_totals,
@@ -376,7 +411,17 @@ def _measure(
         where=channel_totals > 0,
     )
     channel_accuracy = float(np.mean(np.diag(channel_matrix)))
-    efficiency = float(np.mean(np.sum(output_intensity * masks, axis=(1, 2))))
+    # MATLAB sums each output channel over every input mode, then divides by
+    # the total output energy of the mode with the same channel index.
+    channel_energy_all_inputs = channel_energy.sum(axis=0)
+    mode_output_energy = output_intensity.sum(axis=(1, 2))
+    efficiency_per_channel = np.divide(
+        channel_energy_all_inputs,
+        mode_output_energy,
+        out=np.zeros_like(channel_energy_all_inputs),
+        where=mode_output_energy > 0,
+    )
+    efficiency = float(np.mean(efficiency_per_channel))
 
     mse = float(np.mean(np.sum((output_intensity - target_intensity) ** 2, axis=(1, 2))))
     output_energy = float(np.sum(output_intensity))
@@ -399,6 +444,25 @@ def _measure(
         ),
     }
     return {"metrics": metrics, "visibility_matrix": visibility_matrix, "channel_matrix": channel_matrix}
+
+
+def _adjust_cost_weights(
+    base_weights: FloatArray, metrics: dict[str, float], reset_count: int
+) -> FloatArray:
+    scales = np.array(
+        [
+            1.0,
+            metrics["channel_accuracy"],
+            metrics["visibility"],
+            1 - metrics["loss"],
+            metrics["efficiency"],
+        ]
+    )
+    adjusted = np.divide(base_weights, np.maximum(scales, np.finfo(np.float64).eps))
+    # An odd reset would make the first weight 1 - 10 = -9. Near-zero total
+    # weight then produces a large negative cost and destabilizes SPSA.
+    adjusted[0] = max(0.0, adjusted[0] + 10 * (-1) ** reset_count)
+    return adjusted
 
 
 class _TorchBackend:
@@ -457,7 +521,7 @@ class _TorchBackend:
             torch.arange(config.grid_size, dtype=torch.float64, device=self.device),
             indexing="ij",
         )
-        radius = config.output_channel_size / (2 * config.pixel_size)
+        radius = _target_mode_width(config) / 2
         self.masks = torch.stack(
             [
                 (yy - int(center_y)).square() + (xx - int(center_x)).square()
@@ -521,7 +585,7 @@ class _TorchBackend:
         ).transpose(1, 2).clone()
         coefficient_grids[:, basis_size // 2, basis_size // 2] = 0
 
-        screens = torch.ones(
+        screens = torch.zeros(
             (config.num_screens, config.grid_size, config.grid_size),
             dtype=torch.complex128,
             device=self.device,
@@ -599,7 +663,7 @@ class _TorchBackend:
         output_vectors = output_intensity.reshape(config.num_modes, -1)
         target_vectors = target_intensity.reshape(config.num_modes, -1)
 
-        visibility_matrix = (output_vectors @ target_vectors.T).square()
+        visibility_matrix = (target_vectors @ output_vectors.T).square()
         column_sums = visibility_matrix.sum(dim=0, keepdim=True)
         visibility_matrix = torch.where(
             column_sums > 0,
@@ -611,7 +675,7 @@ class _TorchBackend:
         channel_energy = torch.einsum(
             "iyx,jyx->ij", output_intensity, self.masks.to(torch.float64)
         )
-        channel_totals = channel_energy.sum(dim=1, keepdim=True)
+        channel_totals = channel_energy.sum(dim=0, keepdim=True)
         channel_matrix = torch.where(
             channel_totals > 0,
             channel_energy
@@ -619,7 +683,14 @@ class _TorchBackend:
             0,
         )
         channel_accuracy = torch.diagonal(channel_matrix).mean()
-        efficiency = (output_intensity * self.masks).sum(dim=(1, 2)).mean()
+        channel_energy_all_inputs = channel_energy.sum(dim=0)
+        mode_output_energy = output_intensity.sum(dim=(1, 2))
+        efficiency = torch.where(
+            mode_output_energy > 0,
+            channel_energy_all_inputs
+            / mode_output_energy.clamp_min(torch.finfo(torch.float64).tiny),
+            0,
+        ).mean()
         mse = (output_intensity - target_intensity).square().sum(dim=(1, 2)).mean()
         output_energy = output_intensity.sum()
         loss = torch.clamp(1 - output_energy / config.num_modes, min=0)
@@ -656,7 +727,7 @@ def run_simulation(
     inputs = _lg_modes(config, x, y)
     # 几个目标光斑的中心要隔多少个像素
     spacing = min(
-        int(np.ceil(config.output_channel_size / config.pixel_size)),
+        _target_mode_width(config),
         max(8, config.grid_size // 3),
     )
     centers_yx = _honeycomb_centers(config.num_modes, config.grid_size, spacing)
@@ -741,21 +812,9 @@ def run_simulation(
                     if config.epochs - (epoch + 1) < 0.8 * config.epochs:
                         cost_weights = base_cost_weights.copy()
                     else:
-                        scales = np.array(
-                            [
-                                1.0,
-                                metrics["channel_accuracy"],
-                                metrics["visibility"],
-                                1 - metrics["loss"],
-                                metrics["efficiency"],
-                            ]
+                        cost_weights = _adjust_cost_weights(
+                            base_cost_weights, metrics, reset_count
                         )
-                        adjusted_weights = np.divide(
-                            base_cost_weights,
-                            np.maximum(scales, np.finfo(np.float64).eps),
-                        )
-                        adjusted_weights[0] += 10 * (-1) ** reset_count
-                        cost_weights = adjusted_weights
                     metrics = measure(outputs, cost_weights)
                     failsafe_coefficients = coefficients.copy()
                     failsafe_error = metrics["cost"]
@@ -839,7 +898,7 @@ def _draw_output_channels(
 ) -> None:
     from matplotlib.patches import Circle
 
-    channel_radius = config.output_channel_size / (2 * config.pixel_size)
+    channel_radius = _target_mode_width(config) / 2
     for channel_index, (center_y, center_x) in enumerate(centers_yx):
         color = colormap(channel_index % 10)
         axis.add_patch(
