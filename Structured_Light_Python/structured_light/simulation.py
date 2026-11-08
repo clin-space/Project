@@ -141,19 +141,21 @@ def _laguerre_polynomial(order: int, alpha: int, value: FloatArray) -> FloatArra
     return current
 
 
+def _lg_charges(num_modes: int) -> tuple[int, ...]:
+    # Even-sized sets omit the zero-charge mode, as in the MATLAB input helper.
+    half_width = num_modes // 2
+    if num_modes % 2:
+        return tuple(range(-half_width, half_width + 1))
+    else:
+        return (*range(-half_width, 0), *range(1, half_width + 1))
+
+
 def _lg_modes(config: SimulationConfig, x: FloatArray, y: FloatArray) -> ComplexArray:
     # 转化成极坐标
     radius = np.hypot(x, y)
     theta = np.arctan2(y, x)
-    # 模式数是偶数时不包含零荷模式
-    if config.num_modes % 2:
-        half_width = config.num_modes // 2
-        charges = range(-half_width, half_width + 1)
-    else:
-        half_width = config.num_modes // 2
-        charges = (*range(-half_width, 0), *range(1, half_width + 1))
     fields = []
-    for charge in charges:
+    for charge in _lg_charges(config.num_modes):
         amplitude = (
             (np.sqrt(2) * radius / config.input_waist) ** abs(charge)
             * np.exp(-(radius / config.input_waist) ** 2)
@@ -422,7 +424,6 @@ def _measure(
         where=mode_output_energy > 0,
     )
     efficiency = float(np.mean(efficiency_per_channel))
-
     mse = float(np.mean(np.sum((output_intensity - target_intensity) ** 2, axis=(1, 2))))
     output_energy = float(np.sum(output_intensity))
     # Every input LG mode is normalized to unit energy before propagation.
@@ -574,17 +575,20 @@ class _TorchBackend:
         config = self.config
         screen_size = config.phase_screen_size or min(300, config.grid_size // 2)
         basis_size = config.fourier_basis_size
+        #把数组搬到 Torch 设备
         coefficients_tensor = torch.as_tensor(
             coefficients, dtype=torch.complex128, device=self.device
         )
         subharmonics_tensor = torch.as_tensor(
             subharmonic_coefficients, dtype=torch.complex128, device=self.device
         )
+        #把每层 121 个系数排成二维频率网格
         coefficient_grids = coefficients_tensor.reshape(
             config.num_screens, basis_size, basis_size
         ).transpose(1, 2).clone()
-        coefficient_grids[:, basis_size // 2, basis_size // 2] = 0
+        coefficient_grids[:, basis_size // 2, basis_size // 2] = 0 #每层的 11×11 网格中间位置是零频
 
+        #相位屏大小
         screens = torch.zeros(
             (config.num_screens, config.grid_size, config.grid_size),
             dtype=torch.complex128,
@@ -594,7 +598,7 @@ class _TorchBackend:
         grid_insertion = slice(grid_start, grid_start + screen_size)
         insertion_start = screen_size // 2 - basis_size // 2
         insertion = slice(insertion_start, insertion_start + basis_size)
-
+        #屏幕的 300×300 区域以外都保持为 0
         for screen_index in range(config.num_screens):
             spectrum = torch.zeros(
                 (screen_size, screen_size),
@@ -863,7 +867,7 @@ def run_simulation(
 
 
 def save_result(result: SimulationResult, output_dir: Path | str) -> None:
-    """Write reproducible numeric outputs and a compact diagnostic plot."""
+    """Write numeric outputs, field images, and separate training curves."""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -888,6 +892,56 @@ def save_result(result: SimulationResult, output_dir: Path | str) -> None:
         centers_yx=result.centers_yx,
     )
     _save_plot(result, output_path / "simulation.png")
+    _save_training_plot(result.history, output_path / "training_metrics.png")
+
+
+def redraw_saved_plot(output_dir: Path | str) -> Path:
+    """Redraw a saved run from its metrics and final phase coefficients, without training."""
+    output_path = Path(output_dir)
+    with (output_path / "summary.json").open(encoding="utf-8") as file:
+        summary = json.load(file)
+    saved_config = summary["config"].copy()
+    # Runs saved before the MATLAB-only objective included this extra weight.
+    saved_config.pop("matched_efficiency_weight", None)
+    config = SimulationConfig(**saved_config)
+    if config.num_subharmonics:
+        raise ValueError(
+            "This run used subharmonics, whose coefficients were not saved; "
+            "the output fields cannot be reconstructed from this result directory."
+        )
+    with (output_path / "metrics.csv").open(newline="", encoding="utf-8") as file:
+        history = [
+            {key: float(value) for key, value in row.items()}
+            for row in csv.DictReader(file)
+        ]
+    with np.load(output_path / "phase_coefficients.npz", allow_pickle=False) as saved:
+        coefficients = saved["coefficients"]
+        centers_yx = saved["centers_yx"]
+
+    x, y = _grid(config)
+    inputs = _lg_modes(config, x, y)
+    targets = _target_modes(config, centers_yx)
+    outputs = _forward(
+        inputs,
+        coefficients,
+        np.empty((0, 9), dtype=np.complex128),
+        config,
+        x,
+        y,
+    )
+    result = SimulationResult(
+        config=config,
+        inputs=inputs,
+        targets=targets,
+        outputs=outputs,
+        centers_yx=centers_yx,
+        coefficients=coefficients,
+        history=history,
+    )
+    plot_path = output_path / "simulation.png"
+    _save_plot(result, plot_path)
+    _save_training_plot(history, output_path / "training_metrics.png")
+    return plot_path
 
 
 def _draw_output_channels(
@@ -910,21 +964,55 @@ def _draw_output_channels(
                 linewidth=1.5,
             )
         )
-        axis.text(
-            center_x,
-            center_y - channel_radius - 2,
-            f"C{channel_index + 1}",
-            color="white",
-            fontsize=7,
-            ha="center",
-            va="bottom",
-            bbox={
-                "facecolor": color,
-                "edgecolor": "none",
-                "alpha": 0.8,
-                "pad": 1,
-            },
+
+
+def _complex_field_rgb(field: ComplexArray) -> FloatArray:
+    """Map complex phase to HSV hue and relative amplitude to brightness."""
+    from matplotlib.colors import hsv_to_rgb
+
+    amplitude = np.abs(field)
+    maximum = float(np.max(amplitude))
+    brightness = amplitude / maximum if maximum > 0 else np.zeros_like(amplitude)
+    hue = np.mod((np.angle(field) + np.pi) / (2 * np.pi), 1)
+    hsv = np.stack((hue, np.ones_like(hue), brightness), axis=-1)
+    return hsv_to_rgb(hsv)
+
+
+def _plot_training_metrics(axis: Any, history: list[dict[str, float]]) -> None:
+    epochs = [row["epoch"] for row in history]
+    marker = "o" if len(epochs) == 1 else None
+    curves = (
+        ("cost", "Cost", "tab:blue", "-"),
+        ("visibility", "Visibility", "tab:purple", "-"),
+        ("efficiency", "MATLAB efficiency", "tab:green", "--"),
+    )
+    for metric, label, color, linestyle in curves:
+        axis.plot(
+            epochs,
+            [row[metric] for row in history],
+            color=color,
+            linestyle=linestyle,
+            marker=marker,
+            label=label,
         )
+    axis.set_title("Training metrics")
+    axis.set_xlabel("Epoch")
+    axis.set_ylabel("Value")
+    axis.grid(alpha=0.25)
+    axis.legend(frameon=False)
+
+
+def _save_training_plot(history: list[dict[str, float]], path: Path) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    figure, axis = plt.subplots(figsize=(8, 4.5))
+    _plot_training_metrics(axis, history)
+    figure.tight_layout()
+    figure.savefig(path, dpi=150)
+    plt.close(figure)
 
 
 def _save_plot(result: SimulationResult, path: Path) -> None:
@@ -932,37 +1020,68 @@ def _save_plot(result: SimulationResult, path: Path) -> None:
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
 
     count = result.config.num_modes
-    figure, axes = plt.subplots(count + 1, 3, figsize=(10, max(4, (count + 1) * 2.4)), squeeze=False)
+    charges = _lg_charges(count)
+    channel_colors = plt.get_cmap("tab10")
+    figure, axes = plt.subplots(
+        count + 1,
+        3,
+        figsize=(12, max(5, count * 2.6 + 1.3)),
+        gridspec_kw={"height_ratios": [1] * count + [0.45]},
+        squeeze=False,
+    )
     for index in range(count):
         items = (
-            (np.abs(result.inputs[index]) ** 2, "Input"),
+            (_complex_field_rgb(result.inputs[index]), "Input phase"),
             (np.abs(result.targets[index]) ** 2, "Target"),
             (np.abs(result.outputs[index]) ** 2, "Output"),
         )
-        for axis, (intensity, title) in zip(axes[index], items):
-            axis.imshow(intensity, cmap="inferno")
-            if title == "Output":
+        for axis, (image, title) in zip(axes[index], items):
+            axis.imshow(image, cmap="inferno" if image.ndim == 2 else None)
+            if title in ("Target", "Output"):
                 _draw_output_channels(
                     axis,
                     result.centers_yx,
                     result.config,
-                    plt.get_cmap("tab10"),
+                    channel_colors,
                 )
-            axis.set_title(f"Mode {index + 1}: {title}")
+            axis.set_title(fr"LG $\ell={charges[index]}$: {title}")
             axis.set_axis_off()
 
-    training_axis = axes[-1, 0]
-    if result.history:
-        training_axis.plot(
-            [row["epoch"] for row in result.history],
-            [row["cost"] for row in result.history],
-        )
-    training_axis.set_title("SPSA training cost")
-    training_axis.set_xlabel("Epoch")
-    training_axis.set_ylabel("Cost")
-    axes[-1, 1].set_axis_off()
+    phase_axis = axes[-1, 0]
+    phases = np.linspace(-np.pi, np.pi, 256, endpoint=False)
+    phase_strip = _complex_field_rgb(np.exp(1j * phases))
+    phase_axis.imshow(
+        phase_strip[np.newaxis, :, :],
+        extent=(-np.pi, np.pi, 0, 1),
+        aspect="auto",
+    )
+    phase_axis.set_title("Input phase color", fontsize=10)
+    phase_axis.set_xticks([-np.pi, 0, np.pi], [r"$-\pi$", "0", r"$\pi$"])
+    phase_axis.set_yticks([])
+    legend_axis = axes[-1, 1]
+    legend_axis.set_axis_off()
+    legend_axis.legend(
+        handles=[
+            Line2D(
+                [], [],
+                color=channel_colors(index % 10),
+                marker="o",
+                markerfacecolor="none",
+                markersize=10,
+                markeredgewidth=1.5,
+                linestyle="none",
+                label=fr"$\ell={charge}$",
+            )
+            for index, charge in enumerate(charges)
+        ],
+        loc="center",
+        ncol=min(3, count),
+        title="Circle color = target LG charge",
+        frameon=False,
+    )
     axes[-1, 2].set_axis_off()
 
     figure.tight_layout()

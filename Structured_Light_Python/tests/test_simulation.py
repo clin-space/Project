@@ -9,17 +9,22 @@ from pathlib import Path
 import numpy as np
 
 from structured_light import SimulationConfig, run_simulation
+from structured_light.cli import build_parser
 from structured_light.simulation import (
     _adjust_cost_weights,
+    _complex_field_rgb,
     _draw_output_channels,
     _forward,
     _honeycomb_centers,
+    _lg_charges,
     _measure,
     _phase_screens,
+    _plot_training_metrics,
     _propagate,
     _target_mode_width,
     _target_modes,
     _transfer_function,
+    redraw_saved_plot,
     save_result,
 )
 
@@ -59,8 +64,21 @@ class SimulationTests(unittest.TestCase):
             self.assertTrue((output_path / "metrics.csv").is_file())
             self.assertTrue((output_path / "phase_coefficients.npz").is_file())
             self.assertTrue((output_path / "simulation.png").is_file())
+            self.assertTrue((output_path / "training_metrics.png").is_file())
+            original_plot = (output_path / "simulation.png").read_bytes()
+            original_training_plot = (output_path / "training_metrics.png").read_bytes()
+            self.assertEqual(redraw_saved_plot(output_path).read_bytes(), original_plot)
+            self.assertEqual(
+                (output_path / "training_metrics.png").read_bytes(),
+                original_training_plot,
+            )
             summary = json.loads((output_path / "summary.json").read_text())
             self.assertIn("visibility", summary["final_metrics"])
+            self.assertNotIn("matched_efficiency", summary["final_metrics"])
+            # Previously saved runs contained this configuration field.
+            summary["config"]["matched_efficiency_weight"] = 3.0
+            (output_path / "summary.json").write_text(json.dumps(summary))
+            self.assertEqual(redraw_saved_plot(output_path).read_bytes(), original_plot)
 
     def test_output_channel_overlay_matches_measurement_regions(self) -> None:
         import matplotlib
@@ -75,7 +93,10 @@ class SimulationTests(unittest.TestCase):
             _draw_output_channels(axis, centers, config, plt.get_cmap("tab10"))
 
             self.assertEqual(len(axis.patches), len(centers))
-            self.assertEqual(len(axis.texts), len(centers))
+            self.assertEqual(len(axis.texts), 0)
+            self.assertEqual(
+                len({patch.get_edgecolor() for patch in axis.patches}), len(centers)
+            )
             for patch, (center_y, center_x) in zip(axis.patches, centers):
                 self.assertEqual(patch.center, (center_x, center_y))
                 self.assertEqual(
@@ -84,6 +105,50 @@ class SimulationTests(unittest.TestCase):
                 )
         finally:
             plt.close(figure)
+
+    def test_input_phase_colors_follow_matlab_hsv_mapping(self) -> None:
+        field = np.array([[0j, 1 + 0j, -1 + 0j, 1j]])
+        rgb = _complex_field_rgb(field)
+
+        np.testing.assert_allclose(rgb[0, 0], [0, 0, 0])
+        np.testing.assert_allclose(rgb[0, 1], [0, 1, 1])
+        np.testing.assert_allclose(rgb[0, 2], [1, 0, 0])
+        np.testing.assert_allclose(rgb[0, 3], [0.5, 0, 1])
+
+    def test_training_plot_overlays_cost_visibility_and_matlab_efficiency(self) -> None:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        history = [
+            {"epoch": 1.0, "cost": 0.5, "visibility": 0.2,
+             "efficiency": 0.7},
+            {"epoch": 2.0, "cost": 0.4, "visibility": 0.3,
+             "efficiency": 0.8},
+        ]
+        figure, axis = plt.subplots()
+        try:
+            _plot_training_metrics(axis, history)
+
+            self.assertEqual(len(figure.axes), 1)
+            self.assertEqual(len(axis.lines), 3)
+            np.testing.assert_array_equal(axis.lines[0].get_ydata(), [0.5, 0.4])
+            np.testing.assert_array_equal(axis.lines[1].get_ydata(), [0.2, 0.3])
+            np.testing.assert_array_equal(axis.lines[2].get_ydata(), [0.7, 0.8])
+            self.assertEqual(
+                [line.get_label() for line in axis.lines],
+                ["Cost", "Visibility", "MATLAB efficiency"],
+            )
+        finally:
+            plt.close(figure)
+
+    def test_nine_mode_charges_and_cli_modes(self) -> None:
+        self.assertEqual(_lg_charges(9), tuple(range(-4, 5)))
+        self.assertEqual(_lg_charges(4), (-2, -1, 1, 2))
+        args = build_parser().parse_args(["--modes", "9"])
+        self.assertEqual(args.modes, 9)
+        self.assertFalse(hasattr(args, "matched_efficiency_weight"))
 
     @unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch is optional.")
     def test_default_backend_matches_numpy_without_training(self) -> None:
@@ -222,6 +287,45 @@ class SimulationTests(unittest.TestCase):
 
         self.assertAlmostEqual(metrics["efficiency"], ((2 + 5) / 5 + (3 + 7) / 12) / 2)
         self.assertAlmostEqual(metrics["channel_accuracy"], (2 / 7 + 7 / 10) / 2)
+
+    def test_default_cost_uses_only_matlab_efficiency(self) -> None:
+        centers = np.array([[12, 12], [36, 36]])
+        outputs = np.zeros((2, 48, 48), dtype=np.complex128)
+        for mode_index in range(2):
+            outputs[mode_index, *centers[mode_index]] = np.sqrt(0.6)
+            outputs[mode_index, *centers[1 - mode_index]] = np.sqrt(0.3)
+        targets = np.zeros_like(outputs)
+        metrics = _measure(
+            outputs, targets, centers,
+            SimulationConfig(grid_size=48, num_modes=2, output_channel_size=4 * 8e-6, backend="numpy"),
+        )["metrics"]
+
+        self.assertNotIn("matched_efficiency", metrics)
+        self.assertAlmostEqual(
+            metrics["cost"],
+            (metrics["mse"] + 3 * (1 - metrics["visibility"])
+             + 2 * metrics["loss"] + 3 * (1 - metrics["efficiency"])) / 9,
+        )
+
+    def test_nine_mode_training_uses_uncapped_matlab_efficiency(self) -> None:
+        result = run_simulation(
+            SimulationConfig(
+                grid_size=96,
+                phase_screen_size=48,
+                num_modes=9,
+                epochs=1,
+                backend="numpy",
+            ),
+            verbose=False,
+        )
+
+        self.assertGreater(result.final_metrics["efficiency"], 1)
+        metrics = result.final_metrics
+        self.assertAlmostEqual(
+            metrics["cost"],
+            (metrics["mse"] + 3 * (1 - metrics["visibility"])
+             + 2 * metrics["loss"] + 3 * (1 - metrics["efficiency"])) / 9,
+        )
 
     def test_visibility_normalizes_each_input_mode(self) -> None:
         config = SimulationConfig(grid_size=32, num_modes=3, backend="numpy")
