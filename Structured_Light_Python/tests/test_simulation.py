@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from structured_light import SimulationConfig, run_simulation
+from structured_light import SimulationConfig, evaluate_coefficients, run_simulation
 from structured_light.cli import build_parser
 from structured_light.simulation import (
     _adjust_cost_weights,
@@ -30,6 +30,19 @@ from structured_light.simulation import (
 
 
 class SimulationTests(unittest.TestCase):
+    def test_evaluate_saved_coefficients_without_training(self) -> None:
+        config = SimulationConfig(
+            grid_size=48, phase_screen_size=24, num_screens=2, backend="numpy"
+        )
+        coefficients = np.zeros((2, 11**2), dtype=np.complex128)
+
+        result = evaluate_coefficients(config, coefficients)
+
+        self.assertEqual(result.coefficients.shape, coefficients.shape)
+        self.assertEqual(result.outputs.shape, (config.num_modes, 48, 48))
+        self.assertEqual(result.history[0]["epoch"], 0.0)
+        self.assertTrue(np.isfinite(result.final_metrics["cost"]))
+
     def test_free_space_propagation_preserves_energy(self) -> None:
         config = SimulationConfig(grid_size=48, epochs=0, backend="numpy")
         rng = np.random.default_rng(4)
@@ -50,9 +63,9 @@ class SimulationTests(unittest.TestCase):
         )
         result = run_simulation(config, verbose=False)
 
-        self.assertEqual(result.inputs.shape, (3, 48, 48))
-        self.assertEqual(result.targets.shape, (3, 48, 48))
-        self.assertEqual(result.outputs.shape, (3, 48, 48))
+        self.assertEqual(result.inputs.shape, (config.num_modes, 48, 48))
+        self.assertEqual(result.targets.shape, (config.num_modes, 48, 48))
+        self.assertEqual(result.outputs.shape, (config.num_modes, 48, 48))
         self.assertEqual(result.coefficients.shape, (2, 11**2))
         self.assertTrue(np.iscomplexobj(result.coefficients))
         self.assertEqual(len(result.history), 1)

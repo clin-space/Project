@@ -96,6 +96,22 @@ print(result.final_metrics)
 
 `SimulationConfig` 默认使用 Torch 和 `device="cuda:0"`；需要兼容旧计算路径时可传入 `backend="numpy"`。
 
+## 实验流程接口
+
+`structured_light.experimental` 是 `D2NN_Experimental.m` 的 Python 对应入口。它复用 `simulation.py`，不会复制一套 SPSA、Fourier 相位屏或系数评估代码；实验使用的代价函数权重会映射为 MATLAB 的 `[MSE, 1-visibility, 1-efficiency]`。它还提供 OAM/Skyrmion 状态集、绕数计算、双偏振通道判定以及已保存系数的离线表征：
+
+```python
+from structured_light.experimental import ExperimentalConfig, run_experiment
+
+config = ExperimentalConfig(
+    mode="train", grid_size=96, phase_screen_size=48, max_epochs=5,
+    backend="numpy", device="cpu", output_dir="results/experiment_trial",
+)
+result = run_experiment(config)
+```
+
+要在不重新训练的情况下表征 `phase_coefficients.npz`，将 `mode="char"` 并传入 `coefficient_path`。`align`、`measure` 和 `stokes` 涉及实际的 SLM 显示、畸变/光栅标定及 Thorlabs 相机驱动；项目目前没有这些 Python 驱动，因此会明确报出需要实现 `ExperimentalHardware` 适配器，而不会产生虚假的实验测量结果。
+
 该实现侧重于可复现的数值仿真，不包含 MATLAB 项目中的 SLM 硬件控制、实验标定、矢量偏振输入或 Skyrmion 测量流程。SPSA 主参数、输入尺寸、传播起点和周期 failsafe 已按 MATLAB 数值仿真设置；训练状态与 MATLAB 的 `coeff_step` 行为仍不同。为避免失败恢复时出现负权重和接近零的权重总和，Python 对动态调整后的 MSE 权重设有零下限。九模式在缩小的网格上可能出现通道重叠，使 MATLAB 式 `efficiency` 大于 1；该原始值仍直接进入 cost，因此 cost 也可能低于零。
 
 ## 来源

@@ -21,7 +21,7 @@ class SimulationConfig:
     """Physical and numerical settings for a simulation run."""
 
     grid_size: int = 600
-    num_modes: int = 3
+    num_modes: int = 9
     num_screens: int = 5
     epochs: int = 5000
     wavelength: float = 633e-9
@@ -40,6 +40,8 @@ class SimulationConfig:
     perturbation_exponent: float = 0.101
     failsafe_check: int = 10
     failsafe_tolerance: float = 2e-4
+    # Weights for [MSE, 1-channel_accuracy, 1-visibility, loss, 1-efficiency].
+    cost_weights: tuple[float, float, float, float, float] = (1.0, 0.0, 3.0, 2.0, 3.0)
     seed: int = 0
     backend: Literal["numpy", "torch"] = "torch"
     device: str = "cuda:0"
@@ -80,6 +82,10 @@ class SimulationConfig:
             raise ValueError("device must be 'auto', 'cpu', 'cuda', or 'cuda:<index>'.")
         if self.learning_rate_exponent < 0 or self.perturbation_exponent < 0:
             raise ValueError("SPSA decay exponents cannot be negative.")
+        if len(self.cost_weights) != 5 or not np.all(np.isfinite(self.cost_weights)):
+            raise ValueError("cost_weights must contain five finite values.")
+        if any(weight < 0 for weight in self.cost_weights) or sum(self.cost_weights) == 0:
+            raise ValueError("cost_weights must be non-negative and have a positive sum.")
         if min(
             self.wavelength,
             self.pixel_size,
@@ -777,7 +783,7 @@ def run_simulation(
         )["metrics"]
 
     history: list[dict[str, float]] = []
-    base_cost_weights = np.array([1.0, 0.0, 3.0, 2.0, 3.0])
+    base_cost_weights = np.asarray(config.cost_weights, dtype=np.float64)
     cost_weights = base_cost_weights.copy()
     initial_outputs = forward(coefficients)
     initial_metrics = measure(initial_outputs, cost_weights)
@@ -863,6 +869,72 @@ def run_simulation(
         centers_yx=centers_yx,
         coefficients=coefficients,
         history=history,
+    )
+
+
+def evaluate_coefficients(
+    config: SimulationConfig,
+    coefficients: ComplexArray,
+    *,
+    subharmonic_coefficients: ComplexArray | None = None,
+) -> SimulationResult:
+    """Evaluate saved phase-screen coefficients without running SPSA.
+
+    This is the read-only counterpart to :func:`run_simulation`.  It is
+    intended for experimental characterisation scripts which have loaded a
+    previously trained coefficient array.  ``coefficients`` must have shape
+    ``(num_screens, fourier_basis_size ** 2)``.
+    """
+    expected_shape = (config.num_screens, _fourier_coefficient_count(config))
+    coefficients = np.asarray(coefficients, dtype=np.complex128)
+    if coefficients.shape != expected_shape:
+        raise ValueError(
+            "coefficients must have shape "
+            f"{expected_shape}, not {coefficients.shape}."
+        )
+    if subharmonic_coefficients is None:
+        subharmonic_coefficients = np.zeros(
+            (config.num_subharmonics, 9), dtype=np.complex128
+        )
+    else:
+        subharmonic_coefficients = np.asarray(
+            subharmonic_coefficients, dtype=np.complex128
+        )
+    expected_subharmonic_shape = (config.num_subharmonics, 9)
+    if subharmonic_coefficients.shape != expected_subharmonic_shape:
+        raise ValueError(
+            "subharmonic_coefficients must have shape "
+            f"{expected_subharmonic_shape}, not {subharmonic_coefficients.shape}."
+        )
+
+    x, y = _grid(config)
+    inputs = _lg_modes(config, x, y)
+    spacing = min(_target_mode_width(config), max(8, config.grid_size // 3))
+    centers_yx = _honeycomb_centers(config.num_modes, config.grid_size, spacing)
+    targets = _target_modes(config, centers_yx)
+    cost_weights = np.asarray(config.cost_weights, dtype=np.float64)
+
+    if config.backend == "torch":
+        backend = _TorchBackend(config, x, y, inputs, targets, centers_yx)
+        outputs = backend.forward(coefficients, subharmonic_coefficients)
+        metrics = backend.measure(outputs, cost_weights)
+        output_array = backend.to_numpy(outputs)
+    else:
+        output_array = _forward(
+            inputs, coefficients, subharmonic_coefficients, config, x, y
+        )
+        metrics = _measure(
+            output_array, targets, centers_yx, config, cost_weights
+        )["metrics"]
+
+    return SimulationResult(
+        config=config,
+        inputs=inputs,
+        targets=targets,
+        outputs=output_array,
+        centers_yx=centers_yx,
+        coefficients=coefficients.copy(),
+        history=[{"epoch": 0.0, **metrics}],
     )
 
 
